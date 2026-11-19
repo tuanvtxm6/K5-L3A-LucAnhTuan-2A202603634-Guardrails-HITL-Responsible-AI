@@ -4,9 +4,9 @@ Lab 11 — Configuration, provider selection, API keys.
 Hai tầng model (không trộn):
 
   Blue Team (CP2–CP3, guardrails / pipeline / protected agent)
-    → CỐ ĐỊNH OpenRouter ``liquid/lfm-3-1.7b:free``
-       https://openrouter.ai/liquid/lfm-3-1.7b:free
-    → Cần ``OPENROUTER_API_KEY``
+    → CỐ ĐỊNH Liquid AI ``lfm3-1.7b`` (API OpenAI-compatible của liquid.ai)
+       https://api.liquid.ai/openai/v1
+    → Cần ``LIQUID_API_KEY`` (lấy tại https://www.liquid.ai/)
 
   Red Team (CP4)
     → Chọn một provider: OpenAI hoặc Gemini
@@ -32,13 +32,17 @@ except ImportError:
 # --- Providers ---
 PROVIDER_OPENAI = "openai"
 PROVIDER_GEMINI = "gemini"
-PROVIDER_OPENROUTER = "openrouter"
+PROVIDER_OPENROUTER = "openrouter"  # legacy — Blue không còn dùng OpenRouter
+PROVIDER_LIQUID = "liquid"
 
 # --- Blue Team (LOCKED) ---
-BLUE_PROVIDER = PROVIDER_OPENROUTER
-BLUE_MODEL = "liquid/lfm-3-1.7b:free"
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_OPENROUTER_MODEL = BLUE_MODEL  # alias
+BLUE_PROVIDER = PROVIDER_LIQUID
+BLUE_MODEL = "lfm3-1.7b"
+LIQUID_BASE_URL = "https://api.liquid.ai/openai/v1"
+DEFAULT_LIQUID_MODEL = BLUE_MODEL  # alias
+# Legacy aliases (giữ để không vỡ import cũ)
+OPENROUTER_BASE_URL = LIQUID_BASE_URL
+DEFAULT_OPENROUTER_MODEL = BLUE_MODEL
 
 # --- Red Team ---
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
@@ -96,7 +100,7 @@ except FileNotFoundError:
 
 
 # ---------------------------------------------------------------------------
-# Blue Team — fixed OpenRouter Liquid
+# Blue Team — fixed Liquid AI (api.liquid.ai)
 # ---------------------------------------------------------------------------
 
 def get_blue_provider() -> str:
@@ -108,17 +112,21 @@ def get_blue_model() -> str:
     return BLUE_MODEL
 
 
-def get_openrouter_api_key() -> str:
-    return os.environ.get("OPENROUTER_API_KEY", "").strip()
+def get_liquid_api_key() -> str:
+    return os.environ.get("LIQUID_API_KEY", "").strip()
+
+
+# Legacy alias — các call site cũ vẫn chạy, nhưng giờ trả key Liquid.
+get_openrouter_api_key = get_liquid_api_key
 
 
 def blue_client_kwargs() -> dict:
-    """OpenAI SDK kwargs pointing at OpenRouter (Blue Team only)."""
+    """OpenAI SDK kwargs pointing at Liquid AI (Blue Team only)."""
     return {
-        "api_key": get_openrouter_api_key() or None,
+        "api_key": get_liquid_api_key() or None,
         "base_url": (
-            os.environ.get("OPENROUTER_BASE_URL", OPENROUTER_BASE_URL).strip()
-            or OPENROUTER_BASE_URL
+            os.environ.get("LIQUID_BASE_URL", LIQUID_BASE_URL).strip()
+            or LIQUID_BASE_URL
         ),
     }
 
@@ -235,10 +243,10 @@ def is_harder_model() -> bool:
 
 
 def setup_api_key():
-    """Ensure keys for Blue (OpenRouter) + Red / Red Advance (OpenAI or Gemini)."""
-    if not get_openrouter_api_key():
-        os.environ["OPENROUTER_API_KEY"] = input(
-            "Enter OpenRouter API Key (Blue): "
+    """Ensure keys for Blue (Liquid AI) + Red / Red Advance (OpenAI or Gemini)."""
+    if not get_liquid_api_key():
+        os.environ["LIQUID_API_KEY"] = input(
+            "Enter Liquid AI API Key (Blue): "
         ).strip()
     print(f"Blue  — {blue_provider_label()}  [LOCKED]")
 

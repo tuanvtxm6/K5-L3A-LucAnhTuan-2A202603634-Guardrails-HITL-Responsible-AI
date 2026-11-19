@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -42,6 +43,66 @@ InputStatus = Literal["ALLOW", "BLOCK"]
 # Regex is one signal, not the whole security boundary.
 # ============================================================
 
+def normalize_text(text: str) -> str:
+    """Canonicalize text before matching.
+
+    - NFKC: fullwidth / compatibility chars → ASCII (``Ｉｇｎｏｒｅ`` → ``Ignore``)
+    - Drop invisible format chars (zero-width space/joiner, BOM, bidi marks…)
+    - Strip Vietnamese diacritics (``bỏ qua`` → ``bo qua``, ``đ`` → ``d``)
+    - Lowercase + collapse whitespace
+    """
+    if not text:
+        return ""
+    text = unicodedata.normalize("NFKC", text)
+    # Zero-width / format chars (category Cf) — replace with nothing so
+    # "Ignore​ all" → "Ignore all" (the space after ​ remains).
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+    text = text.replace("đ", "d").replace("Đ", "D")
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    text = text.lower()
+    return re.sub(r"\s+", " ", text).strip()
+
+
+# Patterns run on normalize_text() output (lowercase, no diacritics).
+INJECTION_PATTERNS: list[str] = [
+    # 1. Override previous instructions (EN)
+    r"\b(ignore|disregard|forget|override|bypass)\b.{0,20}"
+    r"\b(previous|prior|above|earlier|preceding|original|system|safety|your|all)\s+"
+    r"(instructions?|rules?|prompts?|directives?|guidelines?|guardrails?|policies)\b",
+    r"\b(ignore|disregard|forget)\b.{0,10}\b(everything|all)\b.{0,10}\b(above|before|said)\b",
+    # 2. Role hijack
+    r"\byou are now\b",
+    r"\bfrom now on,? you (are|will|must)\b",
+    # 3. System prompt / hidden config probing
+    r"\bsystem prompt\b",
+    r"\b(developer|system) (message|mode)\b",
+    r"\b(reveal|show|print|display|repeat|output|leak|dump|tell me|translate|"
+    r"summari[sz]e|encode|rewrite|paraphrase|spell out)\b.{0,30}"
+    r"\b(your|hidden|internal|initial|original|secret)\b.{0,15}\b(instructions?|prompt|rules|configuration|config)\b",
+    # 4. Persona / jailbreak
+    r"\bpretend (you are|to be|you're)\b",
+    r"\bact as (a |an )?(unrestricted|unfiltered|uncensored|jailbroken|evil)\b",
+    r"\b(dan|do anything now)\b.{0,40}\b(ai|mode|unrestricted|jailbreak)\b",
+    r"\bjailbreak\b",
+    r"\bno (restrictions|rules|filters|limits)\b",
+    # 5. Credential / secret exfiltration
+    r"\b(reveal|show|give|tell|leak|dump|print|send|share)\b.{0,40}"
+    r"\b(admin|internal|system|database|db|root)\b.{0,20}"
+    r"\b(password|credentials?|api[ _-]?key|secrets?|token|connection string)\b",
+    # 6. Fake injected instruction blocks (indirect / RAG injection)
+    r"(^|\s)(new|updated|real) instructions?\s*:",
+    r"\[\s*(system|admin|instruction)\s*\]",
+    # 7. Vietnamese (sau khi bỏ dấu)
+    r"\b(bo qua|phot lo|quen)\b.{0,20}\b(huong dan|chi dan|lenh|quy tac|chi thi)\b",
+    r"\b(tiet lo|cho (toi|tao|minh) (xem|biet))\b.{0,30}"
+    r"\b(mat khau|system prompt|cau hinh|api key|bi mat)\b",
+    r"\b(gia vo|dong vai)\b.{0,20}\b(ban la|la mot|khong (bi )?gioi han)\b",
+    r"\bban (bay gio|gio) la\b",
+]
+_INJECTION_RE = [re.compile(p, re.IGNORECASE) for p in INJECTION_PATTERNS]
+
+
 def detect_injection(user_input: str) -> InputStatus:
     """Detect prompt injection patterns in user input.
 
@@ -51,14 +112,9 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
-
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+    text = normalize_text(user_input)
+    for pattern in _INJECTION_RE:
+        if pattern.search(text):
             return "BLOCK"
     return "ALLOW"
 
@@ -74,6 +130,13 @@ def detect_injection(user_input: str) -> InputStatus:
 # Return ``"ALLOW"`` if banking-related and OK.
 # ============================================================
 
+# Từ đồng nghĩa banking bổ sung cho ALLOWED_TOPICS trong config.
+_EXTRA_ALLOWED_TOPICS = [
+    "bank", "vinbank", "card", "mortgage", "money", "vnd",
+    "the atm", "khoan vay", "mo the", "sao ke",
+]
+
+
 def topic_filter(user_input: str) -> InputStatus:
     """Decide whether the input is on-topic for VinBank.
 
@@ -84,14 +147,23 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    text = normalize_text(user_input)
+    if not text:
+        return "BLOCK"
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    # 1. Blocked topic → BLOCK. Word-start boundary so "skill" ≠ "kill",
+    #    but "hacking"/"hacker" still match "hack".
+    for topic in BLOCKED_TOPICS:
+        if re.search(rf"\b{re.escape(normalize_text(topic))}", text):
+            return "BLOCK"
 
-    pass  # Replace with your implementation
+    # 2. Must mention at least one banking topic (config + a few synonyms).
+    for topic in list(ALLOWED_TOPICS) + _EXTRA_ALLOWED_TOPICS:
+        if re.search(rf"\b{re.escape(normalize_text(topic))}", text):
+            return "ALLOW"
+
+    # 3. Off-topic
+    return "BLOCK"
 
 
 # ============================================================
@@ -105,6 +177,17 @@ def topic_filter(user_input: str) -> InputStatus:
 #   - Return types.Content to block, or None to pass through
 # ============================================================
 
+INJECTION_BLOCK_MESSAGE = (
+    "Xin lỗi, yêu cầu của bạn có dấu hiệu prompt injection / vượt quyền nên đã bị chặn. "
+    "I can't process requests that try to override my instructions or access internal data."
+)
+TOPIC_BLOCK_MESSAGE = (
+    "Xin lỗi, tôi chỉ hỗ trợ các câu hỏi về dịch vụ ngân hàng VinBank "
+    "(tài khoản, giao dịch, chuyển tiền, tiết kiệm, vay, thẻ tín dụng). "
+    "I can only help with VinBank banking topics."
+)
+
+
 class InputGuardrailPlugin(base_plugin.BasePlugin):
     """Plugin that blocks bad input before it reaches the LLM."""
 
@@ -112,6 +195,7 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         super().__init__(name="input_guardrail")
         self.blocked_count = 0
         self.total_count = 0
+        self.last_reason: str | None = None  # "injection" | "topic" | None
 
     def _extract_text(self, content: types.Content) -> str:
         """Extract plain text from a Content object."""
@@ -143,15 +227,22 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         """
         self.total_count += 1
         text = self._extract_text(user_message)
+        self.last_reason = None
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        # 1. Prompt injection / jailbreak
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            self.last_reason = "injection"
+            return self._block_response(INJECTION_BLOCK_MESSAGE)
 
-        pass  # Replace with your implementation
+        # 2. Off-topic / blocked topic
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            self.last_reason = "topic"
+            return self._block_response(TOPIC_BLOCK_MESSAGE)
+
+        # 3. Both ALLOW → let message through to the LLM
+        return None
 
 
 # ============================================================
